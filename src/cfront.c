@@ -582,7 +582,7 @@ int read_numeric_constant(char buffer[])
 
 int read_parameter_list_decl(var_t vds[], int anon);
 
-void read_inner_var_decl(var_t *vd, int anon)
+void read_inner_var_decl(var_t *vd, int anon, int is_arg)
 {
     vd->init_val = 0;
     if (lex_accept(T_asterisk))
@@ -623,18 +623,18 @@ void read_inner_var_decl(var_t *vd, int anon)
 }
 
 /* starting next_token, need to check the type */
-void read_full_var_decl(var_t *vd, int anon)
+void read_full_var_decl(var_t *vd, int anon, int is_arg)
 {
     lex_accept(T_struct); /* ignore struct definition */
     lex_ident(T_identifier, vd->type_name);
-    read_inner_var_decl(vd, anon);
+    read_inner_var_decl(vd, anon, is_arg);
 }
 
 /* starting next_token, need to check the type */
 void read_partial_var_decl(var_t *vd, var_t *template)
 {
     strcpy(vd->type_name, template->type_name);
-    read_inner_var_decl(vd, 0);
+    read_inner_var_decl(vd, 0, 0);
 }
 
 int read_parameter_list_decl(var_t vds[], int anon)
@@ -642,7 +642,7 @@ int read_parameter_list_decl(var_t vds[], int anon)
     int vn = 0;
     lex_expect(T_open_bracket);
     while (lex_peek(T_identifier, NULL) == 1) {
-        read_full_var_decl(&vds[vn++], anon);
+        read_full_var_decl(&vds[vn++], anon, 1);
         lex_accept(T_comma);
     }
     if (lex_accept(T_elipsis)) {
@@ -673,7 +673,7 @@ void read_literal_param(int param_no)
     ii->int_param1 = index;
 }
 
-void read_numeric_param(int param_no, int isneg)
+int read_numeric_param(int param_no, int isneg)
 {
     char token[MAX_ID_LEN];
     int value = 0;
@@ -715,6 +715,7 @@ void read_numeric_param(int param_no, int isneg)
     if (isneg)
         value = -value;
     ii->int_param1 = value;
+    return value;
 }
 
 void read_char_param(int param_no)
@@ -1992,7 +1993,7 @@ void read_body_statement(block_t *parent)
     type = find_type(token);
     if (type) {
         var = &parent->locals[parent->next_local++];
-        read_full_var_decl(var, 0);
+        read_full_var_decl(var, 0, 0);
         if (lex_accept(T_assign)) {
             read_expr(1, parent); /* get expression value into ?1 */
             read_ternary_operation(1, parent);
@@ -2056,6 +2057,8 @@ void read_code_block(func_t *func, block_t *parent)
     block_t *blk = add_block(parent, func);
     ir_instr_t *ii = add_instr(OP_block_start);
     ii->int_param1 = blk->index;
+
+    new_ir_t *_ii = add_new_ir(OP_block_start);
     lex_expect(T_open_curly);
 
     while (!lex_accept(T_close_curly))
@@ -2063,6 +2066,7 @@ void read_code_block(func_t *func, block_t *parent)
 
     ii = add_instr(OP_block_end);
     ii->int_param1 = blk->index;
+    add_new_ir(OP_block_end);
 }
 
 void read_func_body(func_t *fdef)
@@ -2084,7 +2088,7 @@ void read_global_decl(block_t *block)
 {
     var_t tmp;
     /* new function, or variables under parent */
-    read_full_var_decl(&tmp, 0);
+    read_full_var_decl(&tmp, 0, 0);
 
     if (lex_peek(T_open_bracket, NULL)) {
         ir_instr_t *ii;
@@ -2180,7 +2184,7 @@ void read_global_statement()
             lex_expect(T_open_curly);
             do {
                 var_t *v = &type->fields[i++];
-                read_full_var_decl(v, 0);
+                read_full_var_decl(v, 0, 0);
                 v->offset = size;
                 size += size_var(v);
                 lex_expect(T_semicolon);

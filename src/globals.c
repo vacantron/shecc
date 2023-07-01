@@ -12,6 +12,9 @@ int types_idx = 0;
 ir_instr_t *IR;
 int ir_idx = 0;
 
+new_ir_t *new_IR;
+int new_ir_idx = 0;
+
 alias_t *ALIASES;
 int aliases_idx = 0;
 
@@ -55,6 +58,14 @@ ir_instr_t *add_instr(opcode_t op)
     ii->op_len = 0;
     ii->str_param1 = 0;
     ii->ir_index = ir_idx++;
+    return ii;
+}
+
+new_ir_t *add_new_ir(opcode_t op)
+{
+    new_ir_t *ii = &new_IR[new_ir_idx];
+    ii->op = op;
+    ii->ir_index = new_ir_idx++;
     return ii;
 }
 
@@ -213,6 +224,7 @@ void global_init()
     FUNCS = malloc(MAX_FUNCS * sizeof(func_t));
     TYPES = malloc(MAX_TYPES * sizeof(type_t));
     IR = malloc(MAX_IR_INSTR * sizeof(ir_instr_t));
+    new_IR = malloc(MAX_IR_INSTR * sizeof(new_ir_t));
     SOURCE = malloc(MAX_SOURCE);
     ALIASES = malloc(MAX_ALIASES * sizeof(alias_t));
     CONSTANTS = malloc(MAX_CONSTANTS * sizeof(constant_t));

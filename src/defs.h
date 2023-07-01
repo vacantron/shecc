@@ -35,6 +35,9 @@ typedef enum { TYPE_void = 0, TYPE_int, TYPE_char, TYPE_struct } base_type_t;
 typedef enum {
     /* generic: intermediate use in front-end. No code generation */
     OP_generic,
+    OP_alloca,
+    OP_define,
+    OP_assign,
 
     /* calling convention */
     OP_func_extry, /* function entry point */
@@ -104,6 +107,15 @@ typedef struct {
     int int_param2;
     char *str_param1;
 } ir_instr_t;
+
+typedef struct {
+    opcode_t op;     /* IR operation */
+    int ir_index;    /* index in IR list */
+    int code_offset; /* offset in code */
+    char dest[100];    /* destination */
+    char src0[100];
+    char src1[100];
+} new_ir_t;
 
 /* variable definition */
 typedef struct {
