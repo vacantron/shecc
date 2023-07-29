@@ -7,12 +7,14 @@
 #define MAX_VAR_LEN 64
 #define MAX_TYPE_LEN 64
 #define MAX_PARAMS 8
-#define MAX_LOCALS 48
+#define MAX_LOCALS 1280
 #define MAX_FIELDS 32
 #define MAX_FUNCS 1024
-#define MAX_BLOCKS 262144
+#define MAX_BLOCKS 1024
 #define MAX_TYPES 64
 #define MAX_IR_INSTR 65536
+#define MAX_SYMTBL 1024
+#define MAX_LABEL 1024
 #define MAX_SOURCE 262144
 #define MAX_CODE 262144
 #define MAX_DATA 262144
@@ -28,6 +30,8 @@
 #define ELF_START 0x10000
 #define PTR_SIZE 4
 
+#define REG_CNT 7
+
 /* builtin types */
 typedef enum { TYPE_void = 0, TYPE_int, TYPE_char, TYPE_struct } base_type_t;
 
@@ -35,9 +39,17 @@ typedef enum { TYPE_void = 0, TYPE_int, TYPE_char, TYPE_struct } base_type_t;
 typedef enum {
     /* generic: intermediate use in front-end. No code generation */
     OP_generic,
-    OP_alloca,
+
     OP_define,
+    OP_allocat,
     OP_assign,
+    OP_store,
+    OP_load,
+    OP_global_store,
+    OP_global_load,
+    OP_global_addr_of,
+    OP_branch,
+    OP_func_ret,
 
     /* calling convention */
     OP_func_extry, /* function entry point */
@@ -108,21 +120,13 @@ typedef struct {
     char *str_param1;
 } ir_instr_t;
 
-typedef struct {
-    opcode_t op;     /* IR operation */
-    int ir_index;    /* index in IR list */
-    int code_offset; /* offset in code */
-    char dest[100];    /* destination */
-    char src0[100];
-    char src1[100];
-} new_ir_t;
-
 /* variable definition */
 typedef struct {
     char type_name[MAX_TYPE_LEN];
     char var_name[MAX_VAR_LEN];
     int is_ptr;
     int is_func;
+    int is_global;
     int array_size;
     int offset;   /* offset from stack or frame */
     int init_val; /* for global initialization */
@@ -136,6 +140,7 @@ typedef struct {
     int entry_point; /* IR index */
     int exit_point;  /* IR index */
     int params_size;
+    int va_args;
 } func_t;
 
 /* block definition */
@@ -147,6 +152,54 @@ typedef struct block_t {
     int locals_size;
     int index;
 } block_t;
+
+/* phase-1 IR definition */
+typedef struct {
+    opcode_t op;
+    char func_name[32];
+    int param_num;
+    int size;
+    var_t *dest;
+    var_t *src0;
+    var_t *src1;
+} ph1_ir_t;
+
+/* label lookup table*/
+typedef struct {
+    char name[32];
+    int offset;
+} label_lut_t;
+
+typedef struct {
+    var_t *var;
+    int end;
+    int offset;
+} sym_t;
+
+/* symbol table: store every vars in all blocks of a function */
+/* TODO: migrate into BLOCKS */
+typedef struct {
+    func_t *fn;
+    sym_t syms[MAX_LOCALS];
+    int next_index;
+    int stack_size;
+} sym_tbl_t;
+
+typedef struct {
+    var_t *var;
+    int end;
+} regfile_t;
+
+/* phase-2 IR definition */
+typedef struct {
+    opcode_t op;
+    int src0;
+    int src1;
+    int dest;
+    char func_name[32];
+    char true_label[32];
+    char false_label[32];
+} ph2_ir_t;
 
 /* type definition */
 typedef struct {
@@ -161,6 +214,7 @@ typedef struct {
 typedef struct {
     int size;
     int is_ptr;
+    int is_reference;
     type_t *type;
 } lvalue_t;
 

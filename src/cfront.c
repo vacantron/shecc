@@ -112,6 +112,39 @@ char token_str[MAX_TOKEN_LEN];
 token_t next_token;
 char next_char;
 
+int global_var_idx = 0, global_label_idx = 0;
+char global_str_buf[32];
+
+char *gen_name()
+{
+    sprintf(global_str_buf, ".t%d", global_var_idx++);
+    return global_str_buf;
+}
+
+char *gen_label()
+{
+    sprintf(global_str_buf, ".label.%d", global_label_idx++);
+    return global_str_buf;
+}
+
+var_t *require_var(block_t *blk)
+{
+    return &blk->locals[blk->next_local++];
+}
+
+var_t *operand_stack[20];
+int operand_stack_idx = 0;
+
+void opstack_push(var_t *var)
+{
+    operand_stack[operand_stack_idx++] = var;
+}
+
+var_t *opstack_pop()
+{
+    return operand_stack[--operand_stack_idx];
+}
+
 void skip_whitespace()
 {
     while (is_whitespace(next_char))
@@ -580,9 +613,9 @@ int read_numeric_constant(char buffer[])
     return value;
 }
 
-int read_parameter_list_decl(var_t vds[], int anon);
+void read_parameter_list_decl(func_t *fd, int anon);
 
-void read_inner_var_decl(var_t *vd, int anon, int is_arg)
+void read_inner_var_decl(var_t *vd, int anon, int is_param)
 {
     vd->init_val = 0;
     if (lex_accept(T_asterisk))
@@ -596,11 +629,16 @@ void read_inner_var_decl(var_t *vd, int anon, int is_arg)
         lex_expect(T_asterisk);
         lex_ident(T_identifier, vd->var_name);
         lex_expect(T_close_bracket);
-        read_parameter_list_decl(funargs, 1);
+        /* read_parameter_list_decl(funargs, 1); */
         vd->is_func = 1;
     } else {
-        if (anon == 0)
+        if (anon == 0) {
             lex_ident(T_identifier, vd->var_name);
+            if (!lex_peek(T_open_bracket, NULL) && !is_param) {
+                ph1_ir_t *ph1_ir = add_ph1_ir(OP_allocat);
+                ph1_ir->src0 = vd;
+            }
+        }
         if (lex_accept(T_open_square)) {
             char buffer[10];
 
@@ -623,11 +661,11 @@ void read_inner_var_decl(var_t *vd, int anon, int is_arg)
 }
 
 /* starting next_token, need to check the type */
-void read_full_var_decl(var_t *vd, int anon, int is_arg)
+void read_full_var_decl(var_t *vd, int anon, int is_param)
 {
     lex_accept(T_struct); /* ignore struct definition */
     lex_ident(T_identifier, vd->type_name);
-    read_inner_var_decl(vd, anon, is_arg);
+    read_inner_var_decl(vd, anon, is_param);
 }
 
 /* starting next_token, need to check the type */
@@ -637,54 +675,56 @@ void read_partial_var_decl(var_t *vd, var_t *template)
     read_inner_var_decl(vd, 0, 0);
 }
 
-int read_parameter_list_decl(var_t vds[], int anon)
+void read_parameter_list_decl(func_t *fd, int anon)
 {
     int vn = 0;
     lex_expect(T_open_bracket);
     while (lex_peek(T_identifier, NULL) == 1) {
-        read_full_var_decl(&vds[vn++], anon, 1);
+        read_full_var_decl(&fd->param_defs[vn++], anon, 1);
         lex_accept(T_comma);
     }
     if (lex_accept(T_elipsis)) {
         /* variadic function. Max 8 parameters are passed.
          * create dummy parameters to put all on stack
          */
+        fd->va_args = 1;
         for (; vn < MAX_PARAMS; vn++) {
-            strcpy(vds[vn].type_name, "int");
-            strcpy(vds[vn].var_name, "var_arg");
-            vds[vn].is_ptr = 1;
+            strcpy(fd->param_defs[vn].type_name, "int");
+            strcpy(fd->param_defs[vn].var_name, "var_arg");
+            fd->param_defs[vn].is_ptr = 1;
         }
     }
     lex_expect(T_close_bracket);
-    return vn;
+    fd->num_params = vn;
 }
 
-void read_literal_param(int param_no)
+void read_literal_param(block_t *parent)
 {
-    char literal[MAX_TOKEN_LEN];
-    ir_instr_t *ii;
     int index;
+    char literal[MAX_TOKEN_LEN];
 
     lex_ident(T_string, literal);
-
     index = write_symbol(literal, strlen(literal) + 1);
-    ii = add_instr(OP_load_data_address);
-    ii->param_no = param_no;
-    ii->int_param1 = index;
+
+    ph1_ir_t *ph1_ir = add_ph1_ir(OP_load_data_address);
+    var_t *vd = require_var(parent);
+    strcpy(vd->var_name, gen_name());
+    vd->init_val = index;
+    ph1_ir->dest = vd;
+    opstack_push(vd);
 }
 
-int read_numeric_param(int param_no, int isneg)
+void read_numeric_param(block_t *parent, int is_neg)
 {
     char token[MAX_ID_LEN];
     int value = 0;
     int i = 0;
-    ir_instr_t *ii;
     char c;
 
     lex_ident(T_numeric, token);
 
     if (token[0] == '-') {
-        isneg = 1 - isneg;
+        is_neg = 1 - is_neg;
         i++;
     }
     if ((token[0] == '0') && (token[1] == 'x')) { /* hexadecimal */
@@ -710,39 +750,50 @@ int read_numeric_param(int param_no, int isneg)
         } while (is_digit(token[i]));
     }
 
-    ii = add_instr(OP_load_constant);
-    ii->param_no = param_no;
-    if (isneg)
+    if (is_neg)
         value = -value;
-    ii->int_param1 = value;
-    return value;
+
+    ph1_ir_t *ph1_ir = add_ph1_ir(OP_load_constant);
+    var_t *var = require_var(parent);
+    var->init_val = value;
+    strcpy(var->var_name, gen_name());
+    ph1_ir->dest = var;
+    opstack_push(var);
 }
 
-void read_char_param(int param_no)
+void read_char_param(block_t *parent)
 {
-    ir_instr_t *ii;
     char token[5];
 
     lex_ident(T_char, token);
 
-    ii = add_instr(OP_load_constant);
-    ii->param_no = param_no;
-    ii->int_param1 = token[0];
+    ph1_ir_t *ph1_ir = add_ph1_ir(OP_load_constant);
+    var_t *vd = require_var(parent);
+    vd->init_val = token[0];
+    strcpy(vd->var_name, gen_name());
+    ph1_ir->dest = vd;
+    opstack_push(vd);
 }
 
 void read_ternary_operation(int dest, block_t *parent);
 void read_func_parameters(block_t *parent)
 {
-    int param_num = 0;
+    int i, param_num = 0;
+    var_t *params[MAX_PARAMS];
+
     lex_expect(T_open_bracket);
     while (!lex_accept(T_close_bracket)) {
-        read_expr(param_num++, parent);
-        read_ternary_operation(param_num - 1, parent);
+        read_expr(param_num, parent);
+        read_ternary_operation(param_num, parent);
+
+        params[param_num++] = opstack_pop();
         lex_accept(T_comma);
     }
+    for (i = 0; i < param_num; i++) {
+        ph1_ir_t *ph1_ir = add_ph1_ir(OP_push);
+        ph1_ir->src0 = params[i];
 }
-
-ir_instr_t *exit_ii; /* exit for program */
+}
 
 void read_func_call(func_t *fn, int param_no, block_t *parent)
 {
@@ -753,11 +804,10 @@ void read_func_call(func_t *fn, int param_no, block_t *parent)
     if (lex_peek(T_open_bracket, NULL)) {
         /* direct function call */
         read_func_parameters(parent);
-        ii = add_instr(OP_call);
-        ii->str_param1 = fn->return_def.var_name;
-        ii->param_no = param_no; /* return value here */
-        if (!strcmp(ii->str_param1, "main"))
-            exit_ii->int_param1 = ii->param_no;
+
+        ph1_ir_t *ph1_ir = add_ph1_ir(OP_call);
+        ph1_ir->param_num = fn->num_params;
+        strcpy(ph1_ir->func_name, fn->return_def.var_name);
     } else {
         /* indirect call with function pointer */
         ii = add_instr(OP_address_of);
@@ -801,8 +851,7 @@ void read_indirect_call(int param_no, block_t *parent)
 void read_lvalue(lvalue_t *lvalue,
                  var_t *var,
                  block_t *parent,
-                 int param_no,
-                 int eval,
+                 int dereference,
                  opcode_t op);
 
 /* Maintain a stack of expression values and operators, depending on next
@@ -810,9 +859,9 @@ void read_lvalue(lvalue_t *lvalue,
  */
 void read_expr_operand(int param_no, block_t *parent)
 {
-    int isneg = 0;
+    int is_neg = 0;
     if (lex_accept(T_minus)) {
-        isneg = 1;
+        is_neg = 1;
         if (lex_peek(T_numeric, NULL) == 0 &&
             lex_peek(T_identifier, NULL) == 0 &&
             lex_peek(T_open_bracket, NULL) == 0) {
@@ -820,30 +869,54 @@ void read_expr_operand(int param_no, block_t *parent)
         }
     }
 
+    ph1_ir_t *ph1_ir;
     if (lex_peek(T_string, NULL))
-        read_literal_param(param_no);
+        read_literal_param(parent);
     else if (lex_peek(T_char, NULL))
-        read_char_param(param_no);
+        read_char_param(parent);
     else if (lex_peek(T_numeric, NULL))
-        read_numeric_param(param_no, isneg);
+        read_numeric_param(parent, is_neg);
     else if (lex_accept(T_log_not)) {
         ir_instr_t *ii;
         read_expr_operand(param_no, parent);
         ii = add_instr(OP_log_not);
         ii->param_no = param_no;
+
+        ph1_ir = add_ph1_ir(OP_log_not);
+        ph1_ir->src0 = opstack_pop();
+        var_t *vd = require_var(parent);
+        strcpy(vd->var_name, gen_name());
+        ph1_ir->dest = vd;
+        opstack_push(vd);
     } else if (lex_accept(T_bit_not)) {
         ir_instr_t *ii;
         read_expr_operand(param_no, parent);
         ii = add_instr(OP_bit_not);
         ii->param_no = param_no;
+
+        ph1_ir = add_ph1_ir(OP_bit_not);
+        ph1_ir->src0 = opstack_pop();
+        var_t *vd = require_var(parent);
+        strcpy(vd->var_name, gen_name());
+        ph1_ir->dest = vd;
+        opstack_push(vd);
     } else if (lex_accept(T_ampersand)) {
         char token[MAX_VAR_LEN];
-        var_t *var;
+        var_t *var, *vd;
         lvalue_t lvalue;
 
         lex_peek(T_identifier, token);
         var = find_var(token, parent);
-        read_lvalue(&lvalue, var, parent, param_no, 0, OP_generic);
+        read_lvalue(&lvalue, var, parent, 0, OP_generic);
+
+        if (lvalue.is_reference == 0) {
+            ph1_ir = add_ph1_ir(OP_address_of);
+            ph1_ir->src0 = opstack_pop();
+            vd = require_var(parent);
+            strcpy(vd->var_name, gen_name());
+            ph1_ir->dest = vd;
+            opstack_push(vd);
+        }
     } else if (lex_accept(T_asterisk)) {
         /* dereference */
         char token[MAX_VAR_LEN];
@@ -854,8 +927,20 @@ void read_expr_operand(int param_no, block_t *parent)
         lex_accept(T_open_bracket);
         lex_peek(T_identifier, token);
         var = find_var(token, parent);
-        read_lvalue(&lvalue, var, parent, param_no, 1, OP_generic);
+        read_lvalue(&lvalue, var, parent, 1, OP_generic);
         lex_accept(T_close_bracket);
+
+        ph1_ir = add_ph1_ir(OP_read);
+        ph1_ir->src0 = opstack_pop();
+        var_t *vd = require_var(parent);
+        if (lvalue.is_ptr > 1)
+            ph1_ir->size = PTR_SIZE;
+        else
+            ph1_ir->size = lvalue.size;
+        strcpy(vd->var_name, gen_name());
+        ph1_ir->dest = vd;
+        opstack_push(vd);
+
         ii = add_instr(OP_read);
         ii->param_no = param_no;
         ii->int_param1 = param_no;
@@ -864,7 +949,7 @@ void read_expr_operand(int param_no, block_t *parent)
         read_expr(param_no, parent);
         lex_expect(T_close_bracket);
 
-        if (isneg) {
+        if (is_neg) {
             ir_instr_t *ii = add_instr(OP_negate);
             ii->param_no = param_no;
         }
@@ -881,6 +966,15 @@ void read_expr_operand(int param_no, block_t *parent)
 
         ii->param_no = param_no;
         ii->int_param1 = type->size;
+
+        ph1_ir = add_ph1_ir(OP_load_constant);
+        var_t *vd = require_var(parent);
+        /* has been aligned */
+        int remainder = type->size & 3;
+        vd->init_val = type->size + (4 - remainder);
+        strcpy(vd->var_name, gen_name());
+        ph1_ir->dest = vd;
+        opstack_push(vd);
         lex_expect(T_close_bracket);
     } else {
         /* function call, constant or variable - read token and determine */
@@ -903,15 +997,17 @@ void read_expr_operand(int param_no, block_t *parent)
         fn = find_func(token);
 
         if (con) {
-            int value = con->value;
-            ir_instr_t *ii = add_instr(OP_load_constant);
-            ii->param_no = param_no;
-            ii->int_param1 = value;
+            ph1_ir = add_ph1_ir(OP_load_constant);
+            var_t *vd = require_var(parent);
+            vd->init_val = con->value;
+            strcpy(vd->var_name, gen_name());
+            ph1_ir->dest = vd;
+            opstack_push(vd);
             lex_expect(T_identifier);
         } else if (var) {
             /* evalue lvalue expression */
             lvalue_t lvalue;
-            read_lvalue(&lvalue, var, parent, param_no, 1, prefix_op);
+            read_lvalue(&lvalue, var, parent, 1, prefix_op);
             /* is it an indirect call with function pointer? */
             if (lex_peek(T_open_bracket, NULL))
                 read_indirect_call(param_no, parent);
@@ -928,6 +1024,12 @@ void read_expr_operand(int param_no, block_t *parent)
              */
             read_func_call(fn, param_no, parent);
 
+            ph1_ir = add_ph1_ir(OP_func_ret);
+            var_t *vd = require_var(parent);
+            strcpy(vd->var_name, gen_name());
+            ph1_ir->dest = vd;
+            opstack_push(vd);
+
             for (pn = param_no - 1; pn >= 0; pn--) {
                 ii = add_instr(OP_pop);
                 ii->param_no = pn;
@@ -938,9 +1040,16 @@ void read_expr_operand(int param_no, block_t *parent)
             error("Unrecognized expression token");
         }
 
-        if (isneg) {
+        if (is_neg) {
             ir_instr_t *ii = add_instr(OP_negate);
             ii->param_no = param_no;
+
+            ph1_ir = add_ph1_ir(OP_negate);
+            ph1_ir->src0 = opstack_pop();
+            var_t *vd = require_var(parent);
+            strcpy(vd->var_name, gen_name());
+            ph1_ir->dest = vd;
+            opstack_push(vd);
         }
     }
 }
@@ -1027,114 +1136,56 @@ opcode_t get_operator()
 
 void read_expr(int param_no, block_t *parent)
 {
-    opcode_t op_stack[10];
-    int op_stack_index = 0;
-    opcode_t op, next_op;
-    ir_instr_t *il;
-
-    /* read value into param_no */
     read_expr_operand(param_no, parent);
 
-    /* check for any operator following */
+    ph1_ir_t *ph1_ir;
+    var_t *vd;
+
+    opcode_t op;
+    opcode_t oper_stack[10];
+    int oper_stack_idx = 0;
+
     op = get_operator();
-    if (op == OP_generic || op == OP_ternary) /* no continuation */
+    if (op == OP_generic)
         return;
 
-    read_expr_operand(param_no + 1, parent);
-    next_op = get_operator();
+    oper_stack[oper_stack_idx++] = op;
+    read_expr_operand(param_no, parent);
+    op = get_operator();
 
-    if (next_op == OP_generic || op == OP_ternary) {
-        /* only two operands, apply and return */
-        il = add_instr(op);
-        il->param_no = param_no;
-        il->int_param1 = param_no + 1;
-        return;
-    }
-
-    /* if more than two operands, then use stack */
-    il = add_instr(OP_push);
-    il->param_no = param_no;
-    il = add_instr(OP_push);
-    il->param_no = param_no + 1;
-    op_stack[0] = op;
-    op_stack_index++;
-    op = next_op;
-
-    while (op != OP_generic && op != OP_ternary) {
-        /* if we have operand on stack, compare priorities */
-        if (op_stack_index > 0) {
-            /* we have a continuation, use stack */
-            int same_op = 0;
+    while (op != OP_generic) {
+        if (oper_stack_idx > 0) {
+            int same = 0;
             do {
-                opcode_t stack_op = op_stack[op_stack_index - 1];
-                if (get_operator_prio(stack_op) >= get_operator_prio(op)) {
-                    /* stack has higher priority operator i.e. 5 * 6 + _
-                     * pop stack and apply operators.
-                     */
-                    il = add_instr(OP_pop);
-                    il->param_no = param_no + 1;
+                opcode_t top_op = oper_stack[oper_stack_idx - 1];
+                if (get_operator_prio(top_op) >= get_operator_prio(op)) {
+                    ph1_ir = add_ph1_ir(top_op);
+                    ph1_ir->src1 = opstack_pop();
+                    ph1_ir->src0 = opstack_pop();
+                    vd = require_var(parent);
+                    strcpy(vd->var_name, gen_name());
+                    ph1_ir->dest = vd;
+                    opstack_push(vd);
 
-                    il = add_instr(OP_pop);
-                    il->param_no = param_no;
-
-                    /* apply stack operator  */
-                    il = add_instr(stack_op);
-                    il->param_no = param_no;
-                    il->int_param1 = param_no + 1;
-
-                    /* push value back on stack */
-                    il = add_instr(OP_push);
-                    il->param_no = param_no;
-
-                    /* pop op stack */
-                    op_stack_index--;
-                } else {
-                    same_op = 1;
+                    oper_stack_idx--;
+                } else
+                    same = 1;
+            } while (oper_stack_idx > 0 && same == 0);
                 }
-                /* continue util next operation is higher prio, i.e. 5 + 6 * _
-                 */
-            } while (op_stack_index > 0 && same_op == 0);
-        }
-
-        /* push operator on stack */
-        op_stack[op_stack_index++] = op;
-
-        /* push value on stack */
         read_expr_operand(param_no, parent);
-        il = add_instr(OP_push);
-        il->param_no = param_no;
-
+        oper_stack[oper_stack_idx++] = op;
         op = get_operator();
     }
 
-    /* unwind stack and apply operations */
-    while (op_stack_index > 0) {
-        opcode_t stack_op = op_stack[op_stack_index - 1];
-
-        /* pop stack and apply operators */
-        il = add_instr(OP_pop);
-        il->param_no = param_no + 1;
-
-        il = add_instr(OP_pop);
-        il->param_no = param_no;
-
-        /* apply stack operator  */
-        il = add_instr(stack_op);
-        il->param_no = param_no;
-        il->int_param1 = param_no + 1;
-
-        if (op_stack_index == 1) /* done */
-            return;
-
-        /* push value back on stack */
-        il = add_instr(OP_push);
-        il->param_no = param_no;
-
-        /* pop op stack */
-        op_stack_index--;
+    while (oper_stack_idx > 0) {
+        ph1_ir = add_ph1_ir(oper_stack[--oper_stack_idx]);
+        ph1_ir->src1 = opstack_pop();
+        ph1_ir->src0 = opstack_pop();
+        vd = require_var(parent);
+        strcpy(vd->var_name, gen_name());
+        ph1_ir->dest = vd;
+        opstack_push(vd);
     }
-
-    error("Unexpected end of expression");
 }
 
 /* Return the address that an expression points to, or evaluate its value.
@@ -1146,78 +1197,93 @@ void read_expr(int param_no, block_t *parent)
 void read_lvalue(lvalue_t *lvalue,
                  var_t *var,
                  block_t *parent,
-                 int param_no,
-                 int eval,
+                 int dereference,
                  opcode_t prefix_op)
 {
+    ph1_ir_t *ph1_ir;
+    var_t *vd;
     ir_instr_t *ii;
-    int is_reference = 1;
 
     /* already peeked and have the variable */
     lex_expect(T_identifier);
 
-    /* load memory location into param */
-    ii = add_instr(OP_address_of);
-    ii->param_no = param_no;
-    ii->str_param1 = var->var_name;
     lvalue->type = find_type(var->type_name);
     lvalue->size = get_size(var, lvalue->type);
     lvalue->is_ptr = var->is_ptr;
-    if (var->array_size > 0)
-        is_reference = 0;
+    lvalue->is_reference = 0;
 
-    while (lex_peek(T_open_square, NULL) || lex_peek(T_arrow, NULL) ||
+    if (lex_peek(T_open_square, NULL) || lex_peek(T_arrow, NULL) ||
            lex_peek(T_dot, NULL)) {
-        if (lex_accept(T_open_square)) {
-            is_reference = 1;
-            if (var->is_ptr <= 1) /* if nested pointer, still pointer */
-                lvalue->size = lvalue->type->size;
 
-            /* offset, so var must be either a pointer or an array of some type
-             */
+        lvalue->is_reference = 1;
+        opstack_push(var);
+
+        do {
+            if (lex_accept(T_open_square)) {
+                /* offset, so var must be either a pointer or an array of some
+                 * type */
             if (var->is_ptr == 0 && var->array_size == 0)
                 error("Cannot apply square operator to non-pointer");
 
-            /* if var is an array, the memory location points to its start, but
-             * if var is a pointer, we need to dereference.
-             */
-            if (var->is_ptr) {
-                ii = add_instr(OP_read);
-                ii->param_no = param_no;
-                ii->int_param1 = param_no;
-                ii->int_param2 = PTR_SIZE; /* pointer */
-            }
+                /* if nested pointer, still pointer */
+                if (var->is_ptr <= 1)
+                    lvalue->size = lvalue->type->size;
 
-            /* param+1 has the offset in array terms */
-            read_expr(param_no + 1, parent);
+                /* if var is an array, the memory location points to its start,
+                 * but if var is a pointer, we need to dereference.
+             */
+
+                read_expr(0, parent);
 
             /* multiply by element size */
             if (lvalue->size != 1) {
-                ii = add_instr(OP_load_constant);
-                ii->int_param1 = lvalue->size;
-                ii->param_no = param_no + 2;
+                    ph1_ir = add_ph1_ir(OP_load_constant);
+                    vd = require_var(parent);
+                    vd->init_val = lvalue->size;
+                    strcpy(vd->var_name, gen_name());
+                    ph1_ir->dest = vd;
+                    opstack_push(vd);
 
-                ii = add_instr(OP_mul);
-                ii->param_no = param_no + 1;
-                ii->int_param1 = param_no + 2;
+                    ph1_ir = add_ph1_ir(OP_mul);
+                    ph1_ir->src1 = opstack_pop();
+                    ph1_ir->src0 = opstack_pop();
+                    vd = require_var(parent);
+                    strcpy(vd->var_name, gen_name());
+                    ph1_ir->dest = vd;
+                    opstack_push(vd);
             }
 
-            ii = add_instr(OP_add);
-            ii->param_no = param_no;
-            ii->int_param1 = param_no + 1;
+                ph1_ir = add_ph1_ir(OP_add);
+                ph1_ir->src1 = opstack_pop();
+                ph1_ir->src0 = opstack_pop();
+                vd = require_var(parent);
+                strcpy(vd->var_name, gen_name());
+                ph1_ir->dest = vd;
+                opstack_push(vd);
 
             lex_expect(T_close_square);
         } else {
             char token[MAX_ID_LEN];
 
             if (lex_accept(T_arrow)) {
-                /* dereference first */
-                ii = add_instr(OP_read);
-                ii->param_no = param_no;
-                ii->int_param1 = param_no;
-                ii->int_param2 = PTR_SIZE;
-            } else
+                    /* need fix if encounter chaining */
+                    /* ph1_ir = add_ph1_ir(OP_read);
+                    ph1_ir->src0 = opstack_pop();
+                    vd = require_var(parent);
+                    strcpy(vd->var_name, gen());
+                    ph1_ir->dest = vd;
+                    ph1_ir->size = lvalue->size;
+                    opstack_push(vd); */
+                } else {
                 lex_expect(T_dot);
+
+                    ph1_ir = add_ph1_ir(OP_address_of);
+                    ph1_ir->src0 = opstack_pop();
+                    vd = require_var(parent);
+                    strcpy(vd->var_name, gen_name());
+                    ph1_ir->dest = vd;
+                    opstack_push(vd);
+                }
 
             lex_ident(T_identifier, token);
 
@@ -1225,128 +1291,40 @@ void read_lvalue(lvalue_t *lvalue,
             var = find_member(token, lvalue->type);
             lvalue->type = find_type(var->type_name);
             lvalue->is_ptr = var->is_ptr;
-
-            /* reset target */
-            is_reference = 1;
             lvalue->size = get_size(var, lvalue->type);
-            if (var->array_size > 0) {
-                is_reference = 0;
-            }
 
             /* move pointer to offset of structure */
-            ii = add_instr(OP_load_constant);
-            ii->int_param1 = var->offset;
-            ii->param_no = param_no + 1;
 
-            ii = add_instr(OP_add);
-            ii->param_no = param_no;
-            ii->int_param1 = param_no + 1;
+                ph1_ir = add_ph1_ir(OP_load_constant);
+                vd = require_var(parent);
+                strcpy(vd->var_name, gen_name());
+                vd->init_val = var->offset;
+                ph1_ir->dest = vd;
+                opstack_push(vd);
+
+                ph1_ir = add_ph1_ir(OP_add);
+                ph1_ir->src1 = opstack_pop();
+                ph1_ir->src0 = opstack_pop();
+                vd = require_var(parent);
+                strcpy(vd->var_name, gen_name());
+                ph1_ir->dest = vd;
+                opstack_push(vd);
         }
-    }
+        } while (lex_peek(T_open_square, NULL) || lex_peek(T_arrow, NULL) ||
+                 lex_peek(T_dot, NULL));
 
-    if (eval == 0)
-        return;
-
-    /* need to apply pointer arithmetic? */
-    if (lex_peek(T_plus, NULL) &&
-        ((var->is_ptr > 0) || (var->array_size > 0))) {
-        lex_accept(T_plus);
-
-        /* dereference if necessary */
-        if (is_reference) {
-            ii = add_instr(OP_read);
-            ii->param_no = param_no;
-            ii->int_param1 = param_no;
-            ii->int_param2 = PTR_SIZE;
+        if (dereference == 1) {
+            ph1_ir = add_ph1_ir(OP_read);
+            ph1_ir->src0 = opstack_pop();
+            vd = require_var(parent);
+            ph1_ir->size = lvalue->size;
+            strcpy(vd->var_name, gen_name());
+            ph1_ir->dest = vd;
+            opstack_push(vd);
         }
-
-        /* param+1 has the offset in array terms */
-        read_expr_operand(param_no + 1, parent);
-
-        /* shift by offset in type sizes */
-        lvalue->size = lvalue->type->size;
-
-        /* multiply by element size */
-        if (lvalue->size != 1) {
-            ii = add_instr(OP_load_constant);
-            ii->int_param1 = lvalue->size;
-            ii->param_no = param_no + 2;
-
-            ii = add_instr(OP_mul);
-            ii->param_no = param_no + 1;
-            ii->int_param1 = param_no + 2;
-        }
-
-        ii = add_instr(OP_add);
-        ii->param_no = param_no;
-        ii->int_param1 = param_no + 1;
-    } else {
-        /* should NOT dereference if var is of type array and there was
-         * no offset.
-         */
-        if (is_reference) {
-            if (prefix_op != OP_generic) {
-                /* read into (p + 1) */
-                ii = add_instr(OP_read);
-                ii->param_no = param_no + 1;
-                ii->int_param1 = param_no;
-                ii->int_param2 = lvalue->size;
-
-                /* load 1 */
-                ii = add_instr(OP_load_constant);
-                ii->param_no = param_no + 2;
-                ii->int_param1 = 1;
-
-                /* add/sub */
-                ii = add_instr(prefix_op);
-                ii->param_no = param_no + 1;
-                ii->int_param1 = param_no + 2;
-
-                /* store */
-                ii = add_instr(OP_write);
-                ii->param_no = param_no + 1;
-                ii->int_param1 = param_no;
-                ii->int_param2 = lvalue->size;
+    } else
+        opstack_push(var);
             }
-            if (lex_peek(T_increment, NULL) || lex_peek(T_decrement, NULL)) {
-                /* load value into param_no + 1 */
-                ii = add_instr(OP_read);
-                ii->param_no = param_no + 1;
-                ii->int_param1 = param_no;
-                ii->int_param2 = lvalue->size;
-
-                /* push the value */
-                ii = add_instr(OP_push);
-                ii->param_no = param_no + 1;
-
-                /* load 1 */
-                ii = add_instr(OP_load_constant);
-                ii->param_no = param_no + 2;
-                ii->int_param1 = 1;
-
-                /* add 1 */
-                ii = add_instr(lex_accept(T_increment) ? OP_add : OP_sub);
-                ii->param_no = param_no + 1;
-                ii->int_param1 = param_no + 2;
-
-                /* store */
-                ii = add_instr(OP_write);
-                ii->param_no = param_no + 1;
-                ii->int_param1 = param_no;
-                ii->int_param2 = lvalue->size;
-
-                /* pop original  value */
-                ii = add_instr(OP_pop);
-                ii->param_no = param_no;
-            } else {
-                ii = add_instr(OP_read);
-                ii->param_no = param_no;
-                ii->int_param1 = param_no;
-                ii->int_param2 = lvalue->size;
-            }
-        }
-    }
-}
 
 void read_ternary_operation(int dest, block_t *parent)
 {
@@ -1382,6 +1360,7 @@ int read_body_assignment(char *token, block_t *parent, opcode_t prefix_op)
     if (!var)
         var = find_global_var(token);
     if (var) {
+        ph1_ir_t *ph1_ir;
         ir_instr_t *ii;
         int one = 0;
         opcode_t op = OP_generic;
@@ -1389,7 +1368,7 @@ int read_body_assignment(char *token, block_t *parent, opcode_t prefix_op)
         int size = 0;
 
         /* has memory address that we want to set */
-        read_lvalue(&lvalue, var, parent, 0, 0, OP_generic);
+        read_lvalue(&lvalue, var, parent, 0, OP_generic);
         size = lvalue.size;
 
         if (lex_accept(T_increment)) {
@@ -1422,35 +1401,97 @@ int read_body_assignment(char *token, block_t *parent, opcode_t prefix_op)
         }
 
         if (op != OP_generic) {
+            var_t *vd;
             int increment_size = 1;
 
             /* if we have a pointer, shift it by element size */
             if (lvalue.is_ptr)
                 increment_size = lvalue.type->size;
 
-            /* get current value into ?1 */
-            ii = add_instr(OP_read);
-            ii->param_no = 1;
-            ii->int_param1 = 0;
-            ii->int_param2 = size;
-
-            /* set ?2 with either 1 or expression value */
             if (one == 1) {
-                ii = add_instr(OP_load_constant);
-                ii->param_no = 2;
-                ii->int_param1 = increment_size;
+                var_t *t;
+                if (lvalue.is_reference) {
+                    ph1_ir = add_ph1_ir(OP_read);
+                    t = opstack_pop();
+                    ph1_ir->src0 = t;
+                    ph1_ir->size = lvalue.size;
+                    vd = require_var(parent);
+                    strcpy(vd->var_name, gen_name());
+                    ph1_ir->dest = vd;
+                    opstack_push(vd);
+                } else
+                    t = operand_stack[operand_stack_idx - 1];
+
+                ph1_ir = add_ph1_ir(OP_load_constant);
+                vd = require_var(parent);
+                strcpy(vd->var_name, gen_name());
+                vd->init_val = increment_size;
+                ph1_ir->dest = vd;
+
+                ph1_ir = add_ph1_ir(op == OP_add ? OP_add : OP_sub);
+                ph1_ir->src1 = vd;
+                ph1_ir->src0 = opstack_pop();
+                vd = require_var(parent);
+                strcpy(vd->var_name, gen_name());
+                ph1_ir->dest = vd;
+
+                if (lvalue.is_reference) {
+                    ph1_ir = add_ph1_ir(OP_write);
+                    ph1_ir->src0 = vd;
+                    ph1_ir->dest = t;
+                    ph1_ir->size = lvalue.size;
             } else {
+                    ph1_ir = add_ph1_ir(OP_assign);
+                    ph1_ir->src0 = vd;
+                    ph1_ir->dest = t;
+                }
+            } else {
+                var_t *t;
+                if (lvalue.is_reference) {
+                    ph1_ir = add_ph1_ir(OP_read);
+                    t = opstack_pop();
+                    ph1_ir->src0 = t;
+                    vd = require_var(parent);
+                    ph1_ir->size = lvalue.size;
+                    strcpy(vd->var_name, gen_name());
+                    ph1_ir->dest = vd;
+                    opstack_push(vd);
+                } else
+                    t = operand_stack[operand_stack_idx - 1];
+
                 read_expr(2, parent);
 
-                /* multiply by element size if necessary */
-                if (increment_size != 1) {
-                    ii = add_instr(OP_load_constant);
-                    ii->param_no = 3;
-                    ii->int_param1 = increment_size;
+                ph1_ir = add_ph1_ir(OP_load_constant);
+                vd = require_var(parent);
+                vd->init_val = increment_size;
+                strcpy(vd->var_name, gen_name());
+                ph1_ir->dest = vd;
+                opstack_push(vd);
 
-                    ii = add_instr(OP_mul);
-                    ii->param_no = 2;
-                    ii->int_param1 = 3;
+                ph1_ir = add_ph1_ir(OP_mul);
+                ph1_ir->src1 = opstack_pop();
+                ph1_ir->src0 = opstack_pop();
+                vd = require_var(parent);
+                strcpy(vd->var_name, gen_name());
+                ph1_ir->dest = vd;
+                opstack_push(vd);
+
+                ph1_ir = add_ph1_ir(op == OP_add ? OP_add : OP_sub);
+                ph1_ir->src1 = opstack_pop();
+                ph1_ir->src0 = opstack_pop();
+                vd = require_var(parent);
+                strcpy(vd->var_name, gen_name());
+                ph1_ir->dest = vd;
+
+                if (lvalue.is_reference) {
+                    ph1_ir = add_ph1_ir(OP_write);
+                    ph1_ir->src0 = vd;
+                    ph1_ir->dest = t;
+                    ph1_ir->size = lvalue.size;
+                } else {
+                    ph1_ir = add_ph1_ir(OP_assign);
+                    ph1_ir->src0 = vd;
+                    ph1_ir->dest = t;
                 }
             }
 
@@ -1460,6 +1501,17 @@ int read_body_assignment(char *token, block_t *parent, opcode_t prefix_op)
             ii->int_param1 = 2;
         } else {
             read_expr(1, parent); /* get expression value into ?1 */
+
+            if (lvalue.is_reference) {
+                ph1_ir = add_ph1_ir(OP_write);
+                ph1_ir->src0 = opstack_pop();
+                ph1_ir->dest = opstack_pop();
+                ph1_ir->size = lvalue.size;
+            } else {
+                ph1_ir = add_ph1_ir(OP_assign);
+                ph1_ir->src0 = opstack_pop();
+                ph1_ir->dest = opstack_pop();
+            }
         }
 
         read_ternary_operation(1, parent);
@@ -1678,6 +1730,7 @@ void read_code_block(func_t *func, block_t *parent);
 void read_body_statement(block_t *parent)
 {
     char token[MAX_ID_LEN];
+    ph1_ir_t *ph1_ir;
     func_t *fn;
     type_t *type;
     var_t *var;
@@ -1695,84 +1748,127 @@ void read_body_statement(block_t *parent)
     }
 
     if (lex_accept(T_return)) {
-        if (!lex_accept(T_semicolon)) { /* can be "void" */
+        /* return void */
+        if (lex_accept(T_semicolon))
+            return;
+
             /* get expression value into return value */
             read_expr(0, parent);
             read_ternary_operation(0, parent);
             lex_expect(T_semicolon);
-        }
-        fn = parent->func;
-        ii = add_instr(OP_return);
-        ii->str_param1 = fn->return_def.var_name;
+
+        ph1_ir = add_ph1_ir(OP_return);
+        ph1_ir->src0 = operand_stack[--operand_stack_idx];
         return;
     }
 
     if (lex_accept(T_if)) {
-        ir_instr_t *false_jump;
+        var_t *vd;
+
+        char label_true[32], label_false[32], label_end[32];
+        strcpy(label_true, gen_label());
+        strcpy(label_false, gen_label());
+        strcpy(label_end, gen_label());
 
         lex_expect(T_open_bracket);
         read_expr(0, parent); /* get expression value into return value */
         lex_expect(T_close_bracket);
 
-        false_jump = add_instr(OP_jz);
-        false_jump->param_no = 0;
+        ph1_ir = add_ph1_ir(OP_branch);
+        ph1_ir->dest = opstack_pop();
+        vd = require_var(parent);
+        strcpy(vd->var_name, label_true);
+        ph1_ir->src0 = vd;
+        vd = require_var(parent);
+        strcpy(vd->var_name, label_false);
+        ph1_ir->src1 = vd;
+
+        ph1_ir = add_ph1_ir(OP_label);
+        vd = require_var(parent);
+        strcpy(vd->var_name, label_true);
+        ph1_ir->src0 = vd;
 
         read_body_statement(parent);
 
         /* if we have an "else" block, jump to finish */
         if (lex_accept(T_else)) {
             /* jump true branch to finish */
-            ir_instr_t *true_jump = add_instr(OP_jump);
+            ph1_ir_t *fin = add_ph1_ir(OP_jump);
+            vd = require_var(parent);
+            strcpy(vd->var_name, label_end);
+            fin->dest = vd;
 
-            /* we will emit false branch, link false jump here */
-            ii = add_instr(OP_label);
-            false_jump->int_param1 = ii->ir_index;
+            ph1_ir = add_ph1_ir(OP_label);
+            vd = require_var(parent);
+            strcpy(vd->var_name, label_false);
+            ph1_ir->src0 = vd;
 
             /* false branch */
             read_body_statement(parent);
 
-            /* this is finish, link true jump */
-            ii = add_instr(OP_label);
-            true_jump->int_param1 = ii->ir_index;
+            fin = add_ph1_ir(OP_label);
+            vd = require_var(parent);
+            strcpy(vd->var_name, label_end);
+            fin->src0 = vd;
         } else {
             /* this is done, and link false jump */
-            ii = add_instr(OP_label);
-            false_jump->int_param1 = ii->ir_index;
+            ph1_ir = add_ph1_ir(OP_label);
+            vd = require_var(parent);
+            strcpy(vd->var_name, label_false);
+            ph1_ir->src0 = vd;
         }
         return;
     }
 
     if (lex_accept(T_while)) {
-        ir_instr_t *false_jump;
-        ir_instr_t *start_jump =
-            add_instr(OP_jump); /* jump to while condition */
-        ir_instr_t *exit_label = add_instr(OP_label);
-        ir_instr_t *exit_jump = add_instr(OP_jump);
-        ir_instr_t *start_label = add_instr(OP_label); /* start to return to */
+        var_t *vd, *t;
+        char label_start[32], label_body[32], label_end[32];
+        strcpy(label_start, gen_label());
+        strcpy(label_body, gen_label());
+        strcpy(label_end, gen_label());
+
+        ph1_ir = add_ph1_ir(OP_label);
+        t = require_var(parent);
+        strcpy(t->var_name, label_start);
+        ph1_ir->src0 = t;
+
         lex_expect(T_open_bracket);
         read_expr(0, parent); /* get expression value into return value */
         lex_expect(T_close_bracket);
 
-        false_jump = add_instr(OP_jz);
-        false_jump->param_no = 0;
+        ph1_ir = add_ph1_ir(OP_branch);
+        ph1_ir->dest = opstack_pop();
+        vd = require_var(parent);
+        strcpy(vd->var_name, label_body);
+        ph1_ir->src0 = vd;
+        vd = require_var(parent);
+        strcpy(vd->var_name, label_end);
+        ph1_ir->src1 = vd;
 
-        start_jump->int_param1 = start_label->ir_index;
+        ph1_ir = add_ph1_ir(OP_label);
+        vd = require_var(parent);
+        strcpy(vd->var_name, label_body);
+        ph1_ir->src0 = vd;
 
         /* create exit jump for breaks */
-        break_exit_ir_index[break_level++] = exit_label->ir_index;
-        conti_jump_ir_index[continue_level++] = start_label->ir_index;
+        /* break_exit_ir_index[break_level++] = exit_label->ir_index;
+        conti_jump_ir_index[continue_level++] = start_label->ir_index; */
         read_body_statement(parent);
-        break_level--;
-        continue_level--;
+        /* break_level--;
+        continue_level--; */
 
-        /* unconditional jump back to expression */
-        ii = add_instr(OP_jump);
-        ii->int_param1 = start_label->ir_index;
+        ph1_ir = add_ph1_ir(OP_jump);
+        vd = require_var(parent);
+        strcpy(vd->var_name, label_start);
+        ph1_ir->dest = vd;
 
-        /* exit label */
-        ii = add_instr(OP_label);
-        false_jump->int_param1 = ii->ir_index;
-        exit_jump->int_param1 = ii->ir_index;
+        ph1_ir = add_ph1_ir(OP_label);
+        vd = require_var(parent);
+        strcpy(vd->var_name, label_end);
+        ph1_ir->src0 = vd;
+
+        /* workaround to keep variables alive */
+        t->init_val = ph1_ir_idx - 1;
         return;
     }
 
@@ -1997,18 +2093,10 @@ void read_body_statement(block_t *parent)
         if (lex_accept(T_assign)) {
             read_expr(1, parent); /* get expression value into ?1 */
             read_ternary_operation(1, parent);
-            /* assign to our new variable */
 
-            /* load variable location */
-            ii = add_instr(OP_address_of);
-            ii->param_no = 0;
-            ii->str_param1 = var->var_name;
-
-            /* store value at specifc address, but need to know the type/size */
-            ii = add_instr(OP_write);
-            ii->param_no = 1;
-            ii->int_param1 = 0;
-            ii->int_param2 = get_size(var, type);
+            ph1_ir = add_ph1_ir(OP_assign);
+            ph1_ir->src0 = opstack_pop();
+            ph1_ir->dest = var;
         }
         while (lex_accept(T_comma)) {
             /* multiple (partial) declarations */
@@ -2016,19 +2104,10 @@ void read_body_statement(block_t *parent)
             read_partial_var_decl(nv, var); /* partial */
             if (lex_accept(T_assign)) {
                 read_expr(1, parent); /* get expression value into ?1 */
-                /* assign to our new variable */
 
-                /* load variable location */
-                ii = add_instr(OP_address_of);
-                ii->param_no = 0;
-                ii->str_param1 = nv->var_name;
-
-                /* store value at specific address, but need to know the
-                 * type/size */
-                ii = add_instr(OP_write);
-                ii->param_no = 1;
-                ii->int_param1 = 0;
-                ii->int_param2 = get_size(var, type);
+                ph1_ir = add_ph1_ir(OP_assign);
+                ph1_ir->src0 = opstack_pop();
+                ph1_ir->dest = nv;
             }
         }
         lex_expect(T_semicolon);
@@ -2055,54 +2134,45 @@ void read_body_statement(block_t *parent)
 void read_code_block(func_t *func, block_t *parent)
 {
     block_t *blk = add_block(parent, func);
-    ir_instr_t *ii = add_instr(OP_block_start);
-    ii->int_param1 = blk->index;
 
-    new_ir_t *_ii = add_new_ir(OP_block_start);
+    add_ph1_ir(OP_block_start);
     lex_expect(T_open_curly);
 
     while (!lex_accept(T_close_curly))
         read_body_statement(blk);
 
-    ii = add_instr(OP_block_end);
-    ii->int_param1 = blk->index;
-    add_new_ir(OP_block_end);
+    add_ph1_ir(OP_block_end);
 }
 
 void read_func_body(func_t *fdef)
 {
-    ir_instr_t *ii;
-
     read_code_block(fdef, NULL);
 
-    /* only add return when we have no return type, as otherwise there should
+    /*
+     * only add return when we have no return type, as otherwise there should
      * have been a return statement.
      */
-    ii = add_instr(OP_func_exit);
-    ii->str_param1 = fdef->return_def.var_name;
-    fdef->exit_point = ii->ir_index;
 }
 
 /* if first token is type */
 void read_global_decl(block_t *block)
 {
-    var_t tmp;
+    var_t *var = require_var(block);
+    var->is_global = 1;
     /* new function, or variables under parent */
-    read_full_var_decl(&tmp, 0, 0);
+    read_full_var_decl(var, 0, 0);
 
     if (lex_peek(T_open_bracket, NULL)) {
-        ir_instr_t *ii;
-
         /* function */
-        func_t *fd = add_func(tmp.var_name);
-        memcpy(&fd->return_def, &tmp, sizeof(var_t));
+        func_t *fd = add_func(var->var_name);
+        memcpy(&fd->return_def, var, sizeof(var_t));
+        block->next_local--;
 
-        fd->num_params = read_parameter_list_decl(fd->param_defs, 0);
+        read_parameter_list_decl(fd, 0);
 
         if (lex_peek(T_open_curly, NULL)) {
-            ii = add_instr(OP_func_extry);
-            ii->str_param1 = fd->return_def.var_name;
-            fd->entry_point = ii->ir_index;
+            ph1_ir_t *ph1_ir = add_ph1_ir(OP_define);
+            strcpy(ph1_ir->func_name, var->var_name);
 
             read_func_body(fd);
             return;
@@ -2112,12 +2182,11 @@ void read_global_decl(block_t *block)
         error("Syntax error in global declaration");
     }
 
+    /* NO support for global initialization */
     /* is a variable */
-    memcpy(&block->locals[block->next_local++], &tmp, sizeof(var_t));
-
     if (lex_accept(T_assign)) {
-        if (tmp.is_ptr == 0 && tmp.array_size == 0) {
-            read_global_assignment(tmp.var_name);
+        if (var->is_ptr == 0 && var->array_size == 0) {
+            read_global_assignment(var->var_name);
             lex_expect(T_semicolon);
             return;
         }
@@ -2184,7 +2253,7 @@ void read_global_statement()
             lex_expect(T_open_curly);
             do {
                 var_t *v = &type->fields[i++];
-                read_full_var_decl(v, 0, 0);
+                read_full_var_decl(v, 0, 1);
                 v->offset = size;
                 size += size_var(v);
                 lex_expect(T_semicolon);
@@ -2219,7 +2288,6 @@ void read_global_statement()
 void parse_internal()
 {
     /* parser initialization */
-    ir_instr_t *ii;
     type_t *type;
     func_t *fn;
 
@@ -2242,27 +2310,9 @@ void parse_internal()
     /* architecture defines */
     add_alias(ARCH_PREDEFINED, "1");
 
-    /* binary entry point: read params, call main, exit */
-    ii = add_instr(OP_label);
-    ii->str_param1 = "__start";
-    add_instr(OP_start);
-    ii = add_instr(OP_call);
-    ii->str_param1 = "main";
-    ii = add_instr(OP_label);
-    ii->str_param1 = "__exit";
-    exit_ii = add_instr(OP_exit);
-
     /* Linux syscall */
     fn = add_func("__syscall");
-    fn->num_params = 0;
-    ii = add_instr(OP_func_extry);
-    fn->entry_point = ii->ir_index;
-    ii->str_param1 = fn->return_def.var_name;
-    ii = add_instr(OP_syscall);
-    ii->str_param1 = fn->return_def.var_name;
-    ii = add_instr(OP_func_exit);
-    ii->str_param1 = fn->return_def.var_name;
-    fn->exit_point = ii->ir_index;
+    fn->num_params = 4;
 
     /* internal */
     break_level = 0;

@@ -249,7 +249,7 @@ int __format(char *buffer,
 
 void printf(char *str, ...)
 {
-    int *var_args = &str - 4;
+    int *var_args = &str + 4;
     char buffer[200];
     int si = 0, bi = 0, pi = 0;
 
@@ -293,7 +293,7 @@ void printf(char *str, ...)
                 int v = var_args[pi];
                 bi += __format(buffer + bi, v, w, zp, 16, pp);
             }
-            pi--;
+            pi++;
             si++;
         }
     }
@@ -303,11 +303,9 @@ void printf(char *str, ...)
 
 char *memcpy(char *dest, char *src, int count)
 {
-    if (count > 0) {
-        do {
-            count--;
-            dest[count] = src[count];
-        } while (count > 0);
+    while (count > 0) {
+        count--;
+        dest[count] = src[count];
     }
     return dest;
 }
@@ -362,8 +360,8 @@ int fgetc(FILE *stream)
 char *fgets(char *str, int n, FILE *stream)
 {
     int i = 0;
-    do {
-        char c = fgetc(stream);
+    char c = fgetc(stream);
+    while (i < n && str[i] != '\n') {
         if (c == -1 || c == 255) {
             if (i == 0)
                 /* EOF on first char */
@@ -373,8 +371,9 @@ char *fgets(char *str, int n, FILE *stream)
             return str;
         }
         str[i] = c;
+        c = fgetc(stream);
         i++;
-    } while (str[i - 1] != '\n');
+    }
     str[i] = 0;
     return str;
 }
@@ -393,9 +392,9 @@ int fputc(int c, FILE *stream)
  *   https://git.musl-libc.org/cgit/musl/tree/src/malloc/lite_malloc.c
  */
 
-typedef struct block_meta {
+typedef struct block_meta_t {
     int size;
-    struct block_meta *next;
+    struct block_meta_t *next;
     int free;
 } block_meta_t;
 

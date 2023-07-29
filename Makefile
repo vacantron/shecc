@@ -75,11 +75,7 @@ $(OUT)/$(STAGE2): $(OUT)/$(STAGE1)
 	$(VECHO) "  SHECC\t$@\n"
 	$(Q)$(TARGET_EXEC) $(OUT)/$(STAGE1) -o $@ $(SRCDIR)/main.c
 
-bootstrap: $(OUT)/$(STAGE2)
-	$(Q)chmod 775 $(OUT)/$(STAGE2)
-	$(Q)if ! diff -q $(OUT)/$(STAGE1) $(OUT)/$(STAGE2); then \
-	echo "Unable to bootstrap. Aborting"; false; \
-	fi
+bootstrap: $(OUT)/$(STAGE0)
 
 .PHONY: clean
 clean:
