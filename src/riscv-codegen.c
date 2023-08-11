@@ -2,153 +2,6 @@
 
 #include "riscv.c"
 
-/* Compute stack space needed for function's parameters */
-void size_func(func_t *fn)
-{
-    int s = 0, i;
-
-    /* parameters are turned into local variables */
-    for (i = 0; i < fn->num_params; i++) {
-        s += size_var(&fn->param_defs[i]);
-        fn->param_defs[i].offset = s; /* stack offset */
-    }
-
-    /* align to 16 bytes */
-    if ((s & 15) > 0)
-        s = (s - (s & 15)) + 16;
-    if (s > 2047)
-        error("Local stack size exceeded");
-
-    fn->params_size = s;
-}
-
-/* Return stack size required after block local variables */
-int size_block(block_t *blk)
-{
-    int size = 0, i, offset;
-
-    /* our offset starts from parent's offset */
-    if (!blk->parent)
-        offset = blk->func ? blk->func->params_size : 0;
-    else
-        offset = size_block(blk->parent);
-
-    /* declared locals */
-    for (i = 0; i < blk->next_local; i++) {
-        int vs = size_var(&blk->locals[i]);
-        /* look up value off stack */
-        blk->locals[i].offset = size + offset + vs;
-        size += vs;
-    }
-
-    /* align to 16 bytes */
-    if ((size & 15) > 0)
-        size = (size - (size & 15)) + 16;
-    if (size > 2047)
-        error("Local stack size exceeded");
-
-    /* save in block for stack allocation */
-    blk->locals_size = size;
-    return size + offset;
-}
-
-/* Compute stack necessary sizes for all functions */
-void size_funcs(int data_start)
-{
-    block_t *blk;
-    int i;
-
-    /* size functions */
-    for (i = 0; i < funcs_idx; i++)
-        size_func(&FUNCS[i]);
-
-    /* size blocks excl. global block */
-    for (i = 1; i < blocks_idx; i++)
-        size_block(&BLOCKS[i]);
-
-    /* allocate data for globals, in block 0 */
-    blk = &BLOCKS[0];
-    for (i = 0; i < blk->next_local; i++) {
-        blk->locals[i].offset = elf_data_idx; /* set offset in data section */
-        elf_add_symbol(blk->locals[i].var_name, strlen(blk->locals[i].var_name),
-                       data_start + elf_data_idx);
-        /* TODO: add .bss section */
-        if (!strcmp(blk->locals[i].type_name, "int") &&
-            blk->locals[i].init_val != 0)
-            elf_write_data_int(blk->locals[i].init_val);
-        else
-            elf_data_idx += size_var(&blk->locals[i]);
-    }
-}
-
-/* Return expected binary length of an IR instruction in bytes */
-int get_code_length(ir_instr_t *ii)
-{
-    opcode_t op = ii->op;
-
-    switch (op) {
-    case OP_func_extry: {
-        func_t *fn = find_func(ii->str_param1);
-        return 16 + (fn->num_params << 2);
-    }
-    case OP_call:
-    case OP_indirect:
-        return ii->param_no ? 8 : 4;
-    case OP_load_constant:
-        return (ii->int_param1 > -2048 && ii->int_param1 < 2047) ? 4 : 8;
-    case OP_block_start:
-    case OP_block_end: {
-        block_t *blk = &BLOCKS[ii->int_param1];
-        return (blk->next_local > 0) ? 4 : 0;
-    }
-    case OP_syscall:
-        return 20;
-    case OP_eq:
-    case OP_neq:
-    case OP_lt:
-    case OP_leq:
-    case OP_gt:
-    case OP_geq:
-    case OP_func_exit:
-        return 16;
-    case OP_exit:
-        return 12;
-    case OP_load_data_address:
-    case OP_jz:
-    case OP_jnz:
-    case OP_push:
-    case OP_pop:
-    case OP_address_of:
-    case OP_start:
-        return 8;
-    case OP_jump:
-    case OP_return:
-    case OP_add:
-    case OP_sub:
-    case OP_mul:
-    case OP_div:
-    case OP_mod:
-    case OP_read:
-    case OP_write:
-    case OP_log_or:
-    case OP_log_and:
-    case OP_log_not:
-    case OP_bit_or:
-    case OP_bit_and:
-    case OP_bit_xor:
-    case OP_bit_not:
-    case OP_negate:
-    case OP_lshift:
-    case OP_rshift:
-        return 4;
-    case OP_label:
-        return 0;
-    default:
-        error("Unsupported IR opcode");
-    }
-    return 0;
-}
-
 void emit(int code)
 {
     elf_write_code_int(code);
@@ -158,11 +11,13 @@ void expire_regs(int i)
 {
     int t;
     for (t = 0; t < REG_CNT; t++)
-        if (REG[t].end < i)
+        if (REG[t].end < i) {
             REG[t].var = NULL;
+            REG[t].polluted = 0;
+        }
 }
 
-int find_reg(var_t *var)
+int find_in_regs(var_t *var)
 {
     int i;
     for (i = 0; i < REG_CNT; i++)
@@ -171,40 +26,40 @@ int find_reg(var_t *var)
     return -1;
 }
 
-int get_avl_reg(sym_tbl_t *sym_tbl, var_t *var)
+int try_avl_reg()
 {
-    int t;
-    for (t = 0; t < REG_CNT; t++)
-        if (REG[t].var == NULL) {
-            REG[t].var = var;
-            REG[t].end = find_sym(sym_tbl, var)->end;
-            return t;
-        }
+    int i;
+    for (i = 0; i < REG_CNT; i++)
+        if (REG[i].var == NULL)
+            return i;
     return -1;
 }
 
-/* return the available register index, spill out if needs */
-int get_src_reg(sym_tbl_t *sym_tbl, var_t *var, int *reserved)
+/* return the available index of register, spill out if needed */
+int get_src_reg(sym_tbl_t *sym_tbl, var_t *var, int reserved)
 {
-    int reg_idx = find_reg(var);
+    ph2_ir_t *ph2_ir;
+    int reg_idx, i, ofs, t = 0;
+
+    reg_idx = find_in_regs(var);
     if (reg_idx > -1)
         return reg_idx;
 
-    ph2_ir_t *ph2_ir;
-    reg_idx = get_avl_reg(sym_tbl, var);
+    reg_idx = try_avl_reg();
     if (reg_idx > -1) {
+        REG[reg_idx].var = var;
+        REG[reg_idx].end = find_sym(sym_tbl, var)->end;
+        REG[reg_idx].polluted = 0;
+
         ph2_ir = add_ph2_ir(OP_load);
         ph2_ir->dest = reg_idx;
         ph2_ir->src0 = find_sym(sym_tbl, var)->offset;
         return reg_idx;
     }
 
-    int i, ofs;
-    int t = 0;
     for (i = 0; i < REG_CNT; i++) {
-        if (reserved != NULL)
-            if (*reserved == i)
-                continue;
+        if (reserved == i)
+            continue;
         if (REG[i].end > t) {
             t = REG[i].end;
             reg_idx = i;
@@ -228,12 +83,14 @@ int get_src_reg(sym_tbl_t *sym_tbl, var_t *var, int *reserved)
                 sym_tbl->stack_size += 4;
             }
         }
-        if (REG[reg_idx].var->is_global == 1)
-            ph2_ir = add_ph2_ir(OP_global_store);
-        else
-            ph2_ir = add_ph2_ir(OP_store);
-        ph2_ir->src0 = reg_idx;
-        ph2_ir->src1 = ofs;
+        if (REG[reg_idx].polluted) {
+            if (REG[reg_idx].var->is_global == 1)
+                ph2_ir = add_ph2_ir(OP_global_store);
+            else
+                ph2_ir = add_ph2_ir(OP_store);
+            ph2_ir->src0 = reg_idx;
+            ph2_ir->src1 = ofs;
+        }
 
         REG[reg_idx].var = var;
         REG[reg_idx].end = find_sym(sym_tbl, var)->end;
@@ -244,52 +101,54 @@ int get_src_reg(sym_tbl_t *sym_tbl, var_t *var, int *reserved)
             ph2_ir = add_ph2_ir(OP_load);
         ph2_ir->dest = reg_idx;
         ph2_ir->src0 = find_sym(sym_tbl, var)->offset;
+        REG[reg_idx].polluted = 0;
         return reg_idx;
     }
 }
 
+/* `hold_src1` is used for `OP_log_and` */
 int get_dest_reg(sym_tbl_t *sym_tbl,
                  var_t *var,
                  int pc,
-                 int *src0,
-                 int *src1,
-                 int hold_src)
+                 int src0,
+                 int src1,
+                 int hold_src1)
 {
-    int reg_idx = find_reg(var);
-    if (reg_idx > -1)
-        return reg_idx;
+    ph2_ir_t *ph2_ir;
+    int reg_idx, i, ofs, t = 0;
 
-    reg_idx = get_avl_reg(sym_tbl, var);
-    if (reg_idx > -1)
+    reg_idx = find_in_regs(var);
+    if (reg_idx > -1) {
+        REG[reg_idx].polluted = 1;
         return reg_idx;
-
-    if (hold_src == 0) {
-        if (src0 != NULL)
-            if (REG[*src0].end == pc) {
-                REG[*src0].var = var;
-                REG[*src0].end = find_sym(sym_tbl, var)->end;
-                return *src0;
-            }
-        if (src1 != NULL)
-            if (REG[*src1].end == pc) {
-                REG[*src1].var = var;
-                REG[*src1].end = find_sym(sym_tbl, var)->end;
-                return *src1;
-            }
     }
 
-    ph2_ir_t *ph2_ir;
-    int i, ofs;
-    int t = 0;
-    for (i = 0; i < REG_CNT; i++) {
-        if (hold_src == 1) {
-            if (src0 != NULL)
-                if (src0[0] == i)
-                    continue;
-            if (src1 != NULL)
-                if (src1[0] == i)
-                    continue;
+    reg_idx = try_avl_reg();
+    if (reg_idx > -1) {
+        REG[reg_idx].var = var;
+        REG[reg_idx].end = find_sym(sym_tbl, var)->end;
+        REG[reg_idx].polluted = 1;
+        return reg_idx;
+    }
+
+    if (src0 > -1)
+        if (REG[src0].end == pc) {
+            REG[src0].var = var;
+            REG[src0].end = find_sym(sym_tbl, var)->end;
+            REG[src0].polluted = 1;
+            return src0;
         }
+    if (!hold_src1 && src1 > -1)
+        if (REG[src1].end == pc) {
+            REG[src1].var = var;
+            REG[src1].end = find_sym(sym_tbl, var)->end;
+            REG[src1].polluted = 1;
+            return src1;
+        }
+
+    for (i = 0; i < REG_CNT; i++) {
+        if (hold_src1 && src1 == i)
+            continue;
         if (REG[i].end > t) {
             t = REG[i].end;
             reg_idx = i;
@@ -312,27 +171,30 @@ int get_dest_reg(sym_tbl_t *sym_tbl,
                 sym_tbl->stack_size += 4;
             }
         }
-        if (REG[reg_idx].var->is_global == 1)
-            ph2_ir = add_ph2_ir(OP_global_store);
-        else
-            ph2_ir = add_ph2_ir(OP_store);
-        ph2_ir->src0 = reg_idx;
-        ph2_ir->src1 = ofs;
+        if (REG[reg_idx].polluted) {
+            if (REG[reg_idx].var->is_global == 1)
+                ph2_ir = add_ph2_ir(OP_global_store);
+            else
+                ph2_ir = add_ph2_ir(OP_store);
+            ph2_ir->src0 = reg_idx;
+            ph2_ir->src1 = ofs;
+        }
 
         REG[reg_idx].var = var;
         REG[reg_idx].end = find_sym(sym_tbl, var)->end;
+        REG[reg_idx].polluted = 1;
         return reg_idx;
     }
 }
 
 void dump_ph2_ir()
 {
+    ph2_ir_t *ph2_ir;
+    int i;
+
     if (dump_ir == 0)
         return;
 
-    ph2_ir_t *ph2_ir;
-
-    int i, j, k;
     for (i = 0; i < ph2_ir_idx; i++) {
         ph2_ir = &PH2_IR[i];
 
@@ -470,22 +332,32 @@ void dump_ph2_ir()
     }
 }
 
-/* BAD: force to spill all registers to keep the consistence of context in
- *      registers before/after function calling */
-void spill_used_regs(sym_tbl_t *sym_tbl, int *pc)
+/* BAD: clear registers context when entering/exiting a block */
+/* If it's the end of a block, spill the global vars only */
+void spill_used_regs(sym_tbl_t *sym_tbl, int pc, int global_only)
 {
     int i, ofs;
     ph2_ir_t *ph2_ir;
     for (i = 0; i < REG_CNT; i++) {
         if (REG[i].var == NULL)
             continue;
-        if (pc && REG[i].end == *pc)
+
+        /* if the variable only needed by the comparison, don't store it */
+        if (REG[i].end == pc)
             continue;
+
+        if (REG[i].polluted == 0) {
+            REG[i].var = NULL;
+            continue;
+        }
 
         if (REG[i].var->is_global == 1)
             ph2_ir = add_ph2_ir(OP_global_store);
-        else
+        else if (!global_only)
             ph2_ir = add_ph2_ir(OP_store);
+        else
+            continue;
+
         ph2_ir->src0 = i;
         ofs = find_sym(sym_tbl, REG[i].var)->offset;
         if (ofs == -1) {
@@ -499,37 +371,34 @@ void spill_used_regs(sym_tbl_t *sym_tbl, int *pc)
             }
         }
         ph2_ir->src1 = ofs;
+
         REG[i].var = NULL;
+        REG[i].polluted = 0;
     }
 }
 
 void code_generate()
 {
-    dump_ph1_ir();
-    printf("===\n");
-
-    block_t *blk = NULL;
-
     ph1_ir_t *ph1_ir;
     ph2_ir_t *ph2_ir;
     func_t *fn;
     sym_tbl_t *sym_tbl;
-    int ofs;
-    int reg_idx;
-    int reg_idx_src0;
-    int reg_idx_src1;
+    int i, j, ofs;
+    int reg_idx, reg_idx_src0, reg_idx_src1;
+    int elf_data_start;
 
-    strcpy(LABEL_LUT[label_lut_idx].name, "__syscall");
-    LABEL_LUT[label_lut_idx].offset = 24 + 20;
-    label_lut_idx++;
+    int argument_idx = 0;
+    int block_lv = 0;
+
+    char t[16];
+    int is_in_loop, loop_end_idx;
+
+    dump_ph1_ir();
+    printf("===\n");
 
     global_syms = &SYM_TBL[MAX_SYMTBL - 1];
 
     /* BAD: extend the end of life to the loop end for every vars in loop */
-    int is_in_loop = 0, loop_end_idx;
-    char t[16];
-
-    int i, j, k, l;
     for (i = 0; i < ph1_ir_idx; i++) {
         ph1_ir = &PH1_IR[i];
 
@@ -643,15 +512,18 @@ void code_generate()
         }
     }
 
-    for (i = 0; i < REG_CNT; i++)
+    /* reset the register file */
+    for (i = 0; i < REG_CNT; i++) {
         REG[i].var = NULL;
+        REG[i].end = -1;
+        REG[i].polluted = 0;
+    }
 
-    int stack_idx = 0;
     for (i = 0; i < ph1_ir_idx; i++) {
         ph1_ir = &PH1_IR[i];
         expire_regs(i);
 
-        /* BAD: should restore the context of register before calling */
+        /* (maybe) BAD: should restore the context of register before calling */
         if (i > 0 && PH1_IR[i - 1].op == OP_call)
             for (j = 0; j < REG_CNT; j++)
                 REG[j].var = NULL;
@@ -668,115 +540,84 @@ void code_generate()
             for (j = 0; j < fn->num_params; j++) {
                 REG[j].var = sym_tbl->syms[j].var;
                 REG[j].end = sym_tbl->syms[j].end;
+                REG[j].polluted = 1;
             }
             /* if it's variadic, store all values in register first */
             if (fn->va_args == 1)
-                spill_used_regs(sym_tbl, NULL);
+                spill_used_regs(sym_tbl, -1, 0);
 
             break;
-        case OP_allocat:
-            if (ph1_ir->src0->is_global == 1) {
-                find_sym(sym_tbl, ph1_ir->src0)->offset =
-                    global_syms->stack_size;
-                if (ph1_ir->src0->array_size == 0) {
-                    if (strcmp(ph1_ir->src0->type_name, "int") &&
-                        strcmp(ph1_ir->src0->type_name, "char")) {
-                        int remainder =
-                            find_type(ph1_ir->src0->type_name)->size & 3;
-                        global_syms->stack_size +=
-                            find_type(ph1_ir->src0->type_name)->size;
-                        global_syms->stack_size += (4 - remainder);
-                    } else {
-                        /* word aligned */
-                        global_syms->stack_size += 4;
-                    }
+        case OP_allocat: {
+            sym_tbl_t *t;
+
+            if (ph1_ir->src0->is_global == 1)
+                t = global_syms;
+            else
+                t = sym_tbl;
+
+            find_sym(t, ph1_ir->src0)->offset = t->stack_size;
+            if (ph1_ir->src0->array_size == 0) {
+                if (strcmp(ph1_ir->src0->type_name, "int") &&
+                    strcmp(ph1_ir->src0->type_name, "char")) {
+                    int remainder =
+                        find_type(ph1_ir->src0->type_name)->size & 3;
+                    t->stack_size += find_type(ph1_ir->src0->type_name)->size;
+                    t->stack_size += (4 - remainder);
                 } else {
-                    if (ph1_ir->src0->is_ptr)
-                        global_syms->stack_size +=
-                            PTR_SIZE * ph1_ir->src0->array_size;
-                    else
-                        global_syms->stack_size +=
-                            find_type(ph1_ir->src0->type_name)->size *
-                            ph1_ir->src0->array_size;
+                    /* word aligned */
+                    t->stack_size += 4;
                 }
             } else {
-                find_sym(sym_tbl, ph1_ir->src0)->offset = sym_tbl->stack_size;
-                if (ph1_ir->src0->array_size == 0) {
-                    if (strcmp(ph1_ir->src0->type_name, "int") &&
-                        strcmp(ph1_ir->src0->type_name, "char")) {
-                        int remainder =
-                            find_type(ph1_ir->src0->type_name)->size & 3;
-                        sym_tbl->stack_size +=
-                            find_type(ph1_ir->src0->type_name)->size;
-                        sym_tbl->stack_size += (4 - remainder);
-                    } else {
-                        /* word aligned */
-                        sym_tbl->stack_size += 4;
-                    }
-                } else {
-                    sym_tbl->stack_size += PTR_SIZE;
+                t->stack_size += PTR_SIZE;
 
-                    reg_idx =
-                        get_dest_reg(sym_tbl, ph1_ir->src0, i, NULL, NULL, 0);
+                reg_idx = get_dest_reg(t, ph1_ir->src0, i, -1, -1, 0);
+
+                /* Bug: this statement always be fault */
+                if (ph1_ir->src0->is_global == 1)
+                    ph2_ir = add_ph2_ir(OP_global_addr_of);
+                else
                     ph2_ir = add_ph2_ir(OP_address_of);
-                    ph2_ir->src0 = sym_tbl->stack_size;
-                    ph2_ir->dest = reg_idx;
+                ph2_ir->src0 = t->stack_size;
+                ph2_ir->dest = reg_idx;
 
-                    if (ph1_ir->src0->is_ptr)
-                        sym_tbl->stack_size +=
-                            PTR_SIZE * ph1_ir->src0->array_size;
-                    else
-                        sym_tbl->stack_size +=
-                            find_type(ph1_ir->src0->type_name)->size *
-                            ph1_ir->src0->array_size;
-                }
+                if (ph1_ir->src0->is_ptr)
+                    t->stack_size += PTR_SIZE * ph1_ir->src0->array_size;
+                else
+                    t->stack_size += find_type(ph1_ir->src0->type_name)->size *
+                                     ph1_ir->src0->array_size;
             }
-            break;
+        } break;
         case OP_load_constant:
-            reg_idx = get_dest_reg(sym_tbl, ph1_ir->dest, i, NULL, NULL, 0);
-
-            ph2_ir = add_ph2_ir(OP_load_constant);
-            ph2_ir->src0 = ph1_ir->dest->init_val;
-            ph2_ir->dest = reg_idx;
-            break;
         case OP_load_data_address:
-            reg_idx = get_dest_reg(sym_tbl, ph1_ir->dest, i, NULL, NULL, 0);
-            ph2_ir = add_ph2_ir(OP_load_data_address);
+            reg_idx = get_dest_reg(sym_tbl, ph1_ir->dest, i, -1, -1, 0);
+            ph2_ir = add_ph2_ir(ph1_ir->op);
             ph2_ir->src0 = ph1_ir->dest->init_val;
-            ph2_ir->dest = reg_idx;
-            break;
-        case OP_assign:
-            reg_idx_src0 = get_src_reg(sym_tbl, ph1_ir->src0, NULL);
-            reg_idx =
-                get_dest_reg(sym_tbl, ph1_ir->dest, i, &reg_idx_src0, NULL, 0);
-
-            ph2_ir = add_ph2_ir(OP_assign);
-            ph2_ir->src0 = reg_idx_src0;
             ph2_ir->dest = reg_idx;
             break;
         case OP_label:
+            /* spill at the beginning of the while statement */
             if (PH2_IR[ph2_ir_idx - 1].op != OP_branch &&
                 PH2_IR[ph2_ir_idx - 1].op != OP_jump)
-                spill_used_regs(sym_tbl, NULL);
+                spill_used_regs(sym_tbl, -1, 0);
             ph2_ir = add_ph2_ir(OP_label);
             strcpy(ph2_ir->func_name, ph1_ir->src0->var_name);
             break;
         case OP_jump:
-            spill_used_regs(sym_tbl, NULL);
+            spill_used_regs(sym_tbl, -1, 0);
             ph2_ir = add_ph2_ir(OP_jump);
             strcpy(ph2_ir->func_name, ph1_ir->dest->var_name);
             break;
         case OP_branch:
-            spill_used_regs(sym_tbl, &i);
-            reg_idx_src0 = get_src_reg(sym_tbl, ph1_ir->dest, NULL);
+            spill_used_regs(sym_tbl, i, 0);
+            reg_idx_src0 = get_src_reg(sym_tbl, ph1_ir->dest, -1);
             ph2_ir = add_ph2_ir(OP_branch);
             ph2_ir->src0 = reg_idx_src0;
             strcpy(ph2_ir->true_label, ph1_ir->src0->var_name);
             strcpy(ph2_ir->false_label, ph1_ir->src1->var_name);
             break;
         case OP_push:
-            if (stack_idx == 0)
-                spill_used_regs(sym_tbl, NULL);
+            if (argument_idx == 0)
+                spill_used_regs(sym_tbl, -1, 0);
 
             ofs = find_sym(sym_tbl, ph1_ir->src0)->offset;
             if (ph1_ir->src0->is_global)
@@ -784,35 +625,25 @@ void code_generate()
             else
                 ph2_ir = add_ph2_ir(OP_load);
             ph2_ir->src0 = ofs;
-            ph2_ir->dest = stack_idx;
-
-            REG[stack_idx].var = ph1_ir->src0;
-            REG[stack_idx].end = find_sym(sym_tbl, ph1_ir->src0)->end;
-            stack_idx++;
+            ph2_ir->dest = argument_idx;
+            argument_idx++;
             break;
         case OP_call:
             ph2_ir = add_ph2_ir(OP_call);
             strcpy(ph2_ir->func_name, ph1_ir->func_name);
-            stack_idx = 0;
+            argument_idx = 0;
             break;
         case OP_func_ret:
-            j = 0;
-            reg_idx = get_dest_reg(sym_tbl, ph1_ir->dest, i, &j, NULL, 0);
+            reg_idx = get_dest_reg(sym_tbl, ph1_ir->dest, i, 0, -1, 0);
             ph2_ir = add_ph2_ir(OP_assign);
             ph2_ir->src0 = 0;
             ph2_ir->dest = reg_idx;
             break;
         case OP_return:
-            for (j = 0; j < REG_CNT; j++) {
-                if (REG[j].var && REG[j].var->is_global == 1) {
-                    ofs = find_sym(global_syms, REG[j].var)->offset;
-                    ph2_ir = add_ph2_ir(OP_global_store);
-                    ph2_ir->src0 = j;
-                    ph2_ir->src1 = ofs;
-                }
-            }
+            spill_used_regs(sym_tbl, -1, 1);
+
             if (ph1_ir->src0)
-                reg_idx_src0 = get_src_reg(sym_tbl, ph1_ir->src0, NULL);
+                reg_idx_src0 = get_src_reg(sym_tbl, ph1_ir->src0, -1);
             else
                 reg_idx_src0 = -1;
 
@@ -837,7 +668,7 @@ void code_generate()
                 ph2_ir->src0 = j;
                 ph2_ir->src1 = ofs;
             }
-            reg_idx = get_dest_reg(sym_tbl, ph1_ir->dest, i, NULL, NULL, 0);
+            reg_idx = get_dest_reg(sym_tbl, ph1_ir->dest, i, -1, -1, 0);
 
             if (ph1_ir->src0->is_global)
                 ph2_ir = add_ph2_ir(OP_global_addr_of);
@@ -847,28 +678,29 @@ void code_generate()
             ph2_ir->dest = reg_idx;
             break;
         case OP_read:
-            reg_idx_src0 = get_src_reg(sym_tbl, ph1_ir->src0, NULL);
+            reg_idx_src0 = get_src_reg(sym_tbl, ph1_ir->src0, -1);
             reg_idx =
-                get_dest_reg(sym_tbl, ph1_ir->dest, i, &reg_idx_src0, NULL, 0);
+                get_dest_reg(sym_tbl, ph1_ir->dest, i, reg_idx_src0, -1, 0);
             ph2_ir = add_ph2_ir(OP_read);
             ph2_ir->src0 = reg_idx_src0;
             ph2_ir->src1 = ph1_ir->size;
             ph2_ir->dest = reg_idx;
             break;
         case OP_write:
-            reg_idx_src0 = get_src_reg(sym_tbl, ph1_ir->src0, NULL);
-            reg_idx_src1 = get_src_reg(sym_tbl, ph1_ir->dest, &reg_idx_src0);
+            reg_idx_src0 = get_src_reg(sym_tbl, ph1_ir->src0, -1);
+            reg_idx_src1 = get_src_reg(sym_tbl, ph1_ir->dest, reg_idx_src0);
             ph2_ir = add_ph2_ir(OP_write);
             ph2_ir->src0 = reg_idx_src0;
             ph2_ir->src1 = reg_idx_src1;
             ph2_ir->dest = ph1_ir->size;
             break;
+        case OP_assign:
         case OP_negate:
         case OP_bit_not:
         case OP_log_not:
-            reg_idx_src0 = get_src_reg(sym_tbl, ph1_ir->src0, NULL);
+            reg_idx_src0 = get_src_reg(sym_tbl, ph1_ir->src0, -1);
             reg_idx =
-                get_dest_reg(sym_tbl, ph1_ir->dest, i, &reg_idx_src0, NULL, 0);
+                get_dest_reg(sym_tbl, ph1_ir->dest, i, reg_idx_src0, -1, 0);
             ph2_ir = add_ph2_ir(ph1_ir->op);
             ph2_ir->src0 = reg_idx_src0;
             ph2_ir->dest = reg_idx;
@@ -889,10 +721,10 @@ void code_generate()
         case OP_log_or:
         case OP_rshift:
         case OP_lshift:
-            reg_idx_src0 = get_src_reg(sym_tbl, ph1_ir->src0, NULL);
-            reg_idx_src1 = get_src_reg(sym_tbl, ph1_ir->src1, &reg_idx_src0);
-            reg_idx = get_dest_reg(sym_tbl, ph1_ir->dest, i, &reg_idx_src0,
-                                   &reg_idx_src1, 0);
+            reg_idx_src0 = get_src_reg(sym_tbl, ph1_ir->src0, -1);
+            reg_idx_src1 = get_src_reg(sym_tbl, ph1_ir->src1, reg_idx_src0);
+            reg_idx = get_dest_reg(sym_tbl, ph1_ir->dest, i, reg_idx_src0,
+                                   reg_idx_src1, 0);
             ph2_ir = add_ph2_ir(ph1_ir->op);
             ph2_ir->src0 = reg_idx_src0;
             ph2_ir->src1 = reg_idx_src1;
@@ -900,10 +732,10 @@ void code_generate()
             break;
         /* workaround: see details at the codegen of OP_log_and */
         case OP_log_and:
-            reg_idx_src0 = get_src_reg(sym_tbl, ph1_ir->src0, NULL);
-            reg_idx_src1 = get_src_reg(sym_tbl, ph1_ir->src1, &reg_idx_src0);
-            reg_idx = get_dest_reg(sym_tbl, ph1_ir->dest, i, &reg_idx_src0,
-                                   &reg_idx_src1, 1);
+            reg_idx_src0 = get_src_reg(sym_tbl, ph1_ir->src0, -1);
+            reg_idx_src1 = get_src_reg(sym_tbl, ph1_ir->src1, reg_idx_src0);
+            reg_idx = get_dest_reg(sym_tbl, ph1_ir->dest, i, reg_idx_src0,
+                                   reg_idx_src1, 1);
             ph2_ir = add_ph2_ir(ph1_ir->op);
             ph2_ir->src0 = reg_idx_src0;
             ph2_ir->src1 = reg_idx_src1;
@@ -917,9 +749,13 @@ void code_generate()
 
     dump_ph2_ir();
 
-    /* calculate the offset of label */
+    /* calculate the offset of labels */
+    strcpy(LABEL_LUT[label_lut_idx].name, "__syscall");
+    LABEL_LUT[label_lut_idx].offset = 24 + 20;
+    label_lut_idx++;
+
     elf_code_idx = 92; /* 72 + 20 */
-    int block_lv = 0;
+
     for (i = 0; i < ph2_ir_idx; i++) {
         ph2_ir = &PH2_IR[i];
 
@@ -935,6 +771,7 @@ void code_generate()
             block_lv++;
             break;
         case OP_block_end:
+            /* handle the function w/o the explicit return */
             if (--block_lv != 0)
                 break;
             if (!strcmp(fn->return_def.type_name, "void"))
@@ -946,6 +783,9 @@ void code_generate()
             label_lut_idx++;
             break;
         case OP_assign:
+            if (ph2_ir->dest != ph2_ir->src0)
+                elf_code_idx += 4;
+            break;
         case OP_store:
         case OP_load:
         case OP_global_load:
@@ -973,6 +813,11 @@ void code_generate()
             elf_code_idx += 4;
             break;
         case OP_load_constant:
+            if (ph2_ir->src0 > -2048 && ph2_ir->src0 < 2047)
+                elf_code_idx += 4;
+            else
+                elf_code_idx += 8;
+            break;
         case OP_load_data_address:
         case OP_neq:
         case OP_geq:
@@ -995,7 +840,7 @@ void code_generate()
         }
     }
 
-    int elf_data_start = elf_code_start + elf_code_idx;
+    elf_data_start = elf_code_start + elf_code_idx;
     block_lv = 0;
     elf_code_idx = 0;
 
@@ -1058,10 +903,9 @@ void code_generate()
             }
             break;
         case OP_load_constant:
-            if (ph2_ir->src0 > -2048 && ph2_ir->src0 < 2047) {
-                emit(__addi(__zero, __zero, 0));
+            if (ph2_ir->src0 > -2048 && ph2_ir->src0 < 2047)
                 emit(__addi(ph2_ir->dest + 10, __zero, ph2_ir->src0));
-            } else {
+            else {
                 emit(__lui(ph2_ir->dest + 10, rv_hi(ph2_ir->src0)));
                 emit(__addi(ph2_ir->dest + 10, ph2_ir->dest + 10,
                             rv_lo(ph2_ir->src0)));
@@ -1077,7 +921,8 @@ void code_generate()
             emit(__addi(ph2_ir->dest + 10, __sp, ph2_ir->src0));
             break;
         case OP_assign:
-            emit(__addi(ph2_ir->dest + 10, ph2_ir->src0 + 10, 0));
+            if (ph2_ir->dest != ph2_ir->src0)
+                emit(__addi(ph2_ir->dest + 10, ph2_ir->src0 + 10, 0));
             break;
         case OP_branch:
             for (j = 0; j < label_lut_idx; j++)

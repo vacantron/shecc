@@ -30,7 +30,7 @@
 #define ELF_START 0x10000
 #define PTR_SIZE 4
 
-#define REG_CNT 7
+#define REG_CNT 8
 
 /* builtin types */
 typedef enum { TYPE_void = 0, TYPE_int, TYPE_char, TYPE_struct } base_type_t;
@@ -188,6 +188,7 @@ typedef struct {
 typedef struct {
     var_t *var;
     int end;
+    int polluted;
 } regfile_t;
 
 /* phase-2 IR definition */
