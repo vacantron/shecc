@@ -4,15 +4,17 @@
 #define MAX_TOKEN_LEN 256
 #define MAX_ID_LEN 64
 #define MAX_LINE_LEN 256
-#define MAX_VAR_LEN 64
-#define MAX_TYPE_LEN 64
+#define MAX_VAR_LEN 32
+#define MAX_TYPE_LEN 32
 #define MAX_PARAMS 8
-#define MAX_LOCALS 48
+#define MAX_LOCALS 960
 #define MAX_FIELDS 32
-#define MAX_FUNCS 1024
-#define MAX_BLOCKS 262144
+#define MAX_FUNCS 256
+#define MAX_BLOCKS 625
 #define MAX_TYPES 64
-#define MAX_IR_INSTR 65536
+#define MAX_IR_INSTR 32768
+#define MAX_GLOBAL_IR 256
+#define MAX_LABEL 4096
 #define MAX_SOURCE 262144
 #define MAX_CODE 262144
 #define MAX_DATA 262144
@@ -28,6 +30,8 @@
 #define ELF_START 0x10000
 #define PTR_SIZE 4
 
+#define REG_CNT 8
+
 /* builtin types */
 typedef enum { TYPE_void = 0, TYPE_int, TYPE_char, TYPE_struct } base_type_t;
 
@@ -35,6 +39,18 @@ typedef enum { TYPE_void = 0, TYPE_int, TYPE_char, TYPE_struct } base_type_t;
 typedef enum {
     /* generic: intermediate use in front-end. No code generation */
     OP_generic,
+
+    OP_define,
+    OP_allocat,
+    OP_assign,
+    OP_store,
+    OP_load,
+    OP_global_store,
+    OP_global_load,
+    OP_global_addr_of,
+    OP_branch,
+    OP_func_ret,
+    OP_func_addr,
 
     /* calling convention */
     OP_func_extry, /* function entry point */
@@ -93,18 +109,6 @@ typedef enum {
     OP_start
 } opcode_t;
 
-/* IR instruction */
-typedef struct {
-    opcode_t op;     /* IR operation */
-    int op_len;      /* binary length */
-    int ir_index;    /* index in IR list */
-    int code_offset; /* offset in code */
-    int param_no;    /* destination */
-    int int_param1;
-    int int_param2;
-    char *str_param1;
-} ir_instr_t;
-
 /* variable definition */
 typedef struct {
     char type_name[MAX_TYPE_LEN];
@@ -112,8 +116,12 @@ typedef struct {
     int is_ptr;
     int is_func;
     int array_size;
-    int offset;   /* offset from stack or frame */
+    int offset;   /* offset from stack or frame, index 0 is reserved */
     int init_val; /* for global initialization */
+
+    int is_global;
+    int eol; /* end-of-life */
+    int in_loop;
 } var_t;
 
 /* function definition */
@@ -121,9 +129,8 @@ typedef struct {
     var_t return_def;
     var_t param_defs[MAX_PARAMS];
     int num_params;
-    int entry_point; /* IR index */
-    int exit_point;  /* IR index */
-    int params_size;
+    int va_args;
+    int stack_size;
 } func_t;
 
 /* block definition */
@@ -135,6 +142,39 @@ typedef struct block_t {
     int locals_size;
     int index;
 } block_t;
+
+/* phase-1 IR definition */
+typedef struct {
+    opcode_t op;
+    char func_name[32];
+    int param_num;
+    int size;
+    var_t *dest;
+    var_t *src0;
+    var_t *src1;
+} ph1_ir_t;
+
+/* label lookup table*/
+typedef struct {
+    char name[32];
+    int offset;
+} label_lut_t;
+
+typedef struct {
+    var_t *var;
+    int polluted;
+} regfile_t;
+
+/* phase-2 IR definition */
+typedef struct {
+    opcode_t op;
+    int src0;
+    int src1;
+    int dest;
+    char func_name[MAX_VAR_LEN];
+    char true_label[MAX_VAR_LEN];
+    char false_label[MAX_VAR_LEN];
+} ph2_ir_t;
 
 /* type definition */
 typedef struct {
@@ -149,6 +189,8 @@ typedef struct {
 typedef struct {
     int size;
     int is_ptr;
+    int is_func;
+    int is_reference;
     type_t *type;
 } lvalue_t;
 
