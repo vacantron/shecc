@@ -387,6 +387,15 @@ void reg_alloc()
                     ir = bb_add_ph2_ir(bb, insn->opcode);
                     ir->src0 = insn->rd->init_val;
                     ir->dest = dest;
+
+                    /* store global variable immediately after assignment */
+                    if (insn->rd->is_global) {
+                        ir = bb_add_ph2_ir(bb, OP_global_store);
+                        ir->src0 = dest;
+                        ir->src1 = insn->rd->offset;
+                        REGS[dest].polluted = 0;
+                    }
+
                     break;
                 case OP_address_of:
                     /* make sure variable is on stack */

@@ -16,8 +16,8 @@
 #define MAX_PARAMS 8
 #define MAX_LOCALS 1450
 #define MAX_FIELDS 32
-#define MAX_FUNCS 256
-#define MAX_FUNC_TRIES 1950
+#define MAX_FUNCS 512
+#define MAX_FUNC_TRIES 2160
 #define MAX_BLOCKS 1150
 #define MAX_TYPES 64
 #define MAX_IR_INSTR 36864
