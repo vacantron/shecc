@@ -175,6 +175,7 @@ struct var {
     ref_block_list_t ref_block_list; /* blocks which kill variable */
     int consumed;
     int is_ternary_ret;
+    int is_const; /* whether a constant representaion or not */
 };
 
 typedef struct var var_t;
