@@ -1117,6 +1117,9 @@ int mark_const(insn_t *insn)
         return 0;
     if (!insn->prev)
         return 0;
+    /* global variable is unique and has no subscripts in SSA */
+    if (insn->rd->is_global)
+        return 0;
     if (insn->prev->opcode != OP_load_constant)
         return 0;
     if (insn->rs1 != insn->prev->rd)
@@ -1161,7 +1164,7 @@ int eval_const(insn_t *insn)
         res = l % r;
         break;
     default:
-        error("Unexpected opcode in constant evaluation");
+        return 0;
     }
 
     insn->rs1 = NULL;
