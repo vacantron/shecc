@@ -1111,7 +1111,7 @@ int cse(insn_t *insn, basic_block_t *bb)
     return 1;
 }
 
-int mark_const(insn_t *insn)
+int mark_const(insn_t *insn, basic_block_t *bb)
 {
     if (insn->opcode != OP_assign)
         return 0;
@@ -1129,10 +1129,22 @@ int mark_const(insn_t *insn)
     insn->rd->is_const = 1;
     insn->rd->init_val = insn->rs1->init_val;
     insn->rs1 = NULL;
+
+    insn_t *prev = insn->prev;
+    if (prev->rd->var_name[0] != '.')
+        return 0;
+
+    if (!prev->prev) {
+        bb->insn_list.head = insn;
+        insn->prev = NULL;
+    } else {
+        prev->prev->next = insn;
+        insn->prev = prev->prev;
+    }
     return 1;
 }
 
-int eval_const(insn_t *insn)
+int eval_const(insn_t *insn, basic_block_t *bb)
 {
     if (!insn->rs1)
         return 0;
@@ -1172,14 +1184,25 @@ int eval_const(insn_t *insn)
     insn->rd->is_const = 1;
     insn->rd->init_val = res;
     insn->opcode = OP_load_constant;
+
+    insn_t *prev = insn->prev;
+    if (!prev)
+        return 0;
+    if (!prev->prev) {
+        bb->insn_list.head = insn;
+        insn->prev = NULL;
+    } else {
+        prev->prev->next = insn;
+        insn->prev = prev->prev;
+    }
     return 1;
 }
 
-int const_folding(insn_t *insn)
+int const_folding(insn_t *insn, basic_block_t *bb)
 {
-    if (mark_const(insn))
+    if (mark_const(insn, bb))
         return 1;
-    if (eval_const(insn))
+    if (eval_const(insn, bb))
         return 1;
     return 0;
 }
@@ -1198,7 +1221,7 @@ void optimize()
             for (insn = bb->insn_list.head; insn; insn = insn->next) {
                 if (cse(insn, bb))
                     continue;
-                if (const_folding(insn))
+                if (const_folding(insn, bb))
                     continue;
                 /* more optimizations */
             }
